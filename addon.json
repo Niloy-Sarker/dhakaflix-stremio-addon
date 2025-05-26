@@ -1,0 +1,20 @@
+{
+  "id": "com.dhakaflix.streamer",
+  "name": "DhakaFlix",
+  "version": "1.1.0",
+  "description": "DhakaFlix (BDIX) addon for Stremio",
+  "resources": [
+    "stream",
+    "meta"
+  ],
+  "types": [
+    "series",
+    "anime",
+    "movie"
+  ],
+  "catalogs": [],
+  "behaviorHints": {
+    "adult": false,
+    "p2p": false
+  }
+} 

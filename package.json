@@ -1,0 +1,19 @@
+{
+  "name": "dflix-series-streamio-addon",
+  "version": "1.0.0",
+  "description": "DFlix Series addon for Streamio",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "cheerio": "^1.0.0-rc.12",
+    "stremio-addon-sdk": "^1.6.10"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1",
+    "pkg": "^5.8.1"
+  }
+}
