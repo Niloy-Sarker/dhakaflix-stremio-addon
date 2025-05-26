@@ -95,18 +95,31 @@ function updateCacheTimestamp(cacheName, key) {
 function isCacheValid(cacheName, key) {
     const timestamp = cacheTimestamps.get(`${cacheName}:${key}`);
     if (!timestamp) return false;
-    return (Date.now() - timestamp) < CACHE_TTL[cacheName];
+    
+    const elapsed = Date.now() - timestamp;
+    const ttl = CACHE_TTL[cacheName];
+    
+    // Check if cache is approaching expiration (>80% of TTL)
+    if (elapsed > (ttl * 0.8) && elapsed < ttl) {
+        logDebug('CACHE_WARN', `Cache for ${cacheName}:${key} is approaching expiration (${Math.round((elapsed/ttl)*100)}%)`);
+    }
+    
+    return elapsed < ttl;
 }
 
 // Function to clean up old cache entries
 function cleanupCaches() {
     const now = Date.now();
+    const startTime = process.hrtime();
     
-    console.log('Running cache cleanup...');
+    logDebug('CACHE', 'Running cache cleanup...');
     
     const cleanCache = (cache, name) => {
         let removedCount = 0;
+        let totalCount = 0;
+        
         for (const key of cache.keys()) {
+            totalCount++;
             const timestamp = cacheTimestamps.get(`${name}:${key}`);
             if (!timestamp || (now - timestamp > CACHE_TTL[name])) {
                 cache.delete(key);
@@ -114,11 +127,22 @@ function cleanupCaches() {
                 removedCount++;
             }
         }
-        console.log(`Cleaned ${removedCount} old entries from ${name}`);
+        
+        if (removedCount > 0) {
+            logDebug('CACHE', `Cleaned ${removedCount}/${totalCount} entries from ${name} cache`);
+        } else if (totalCount > 0) {
+            logDebug('CACHE', `No expired entries found in ${name} cache (${totalCount} total entries)`);
+        } else {
+            logDebug('CACHE_WARN', `${name} cache is empty`);
+        }
     };
     
     cleanCache(searchCache, 'search');
     cleanCache(streamCache, 'stream');
+    
+    const diff = process.hrtime(startTime);
+    const duration = (diff[0] * 1e9 + diff[1]) / 1e6; // Convert to ms
+    logDebug('CACHE', `Cache cleanup completed in ${duration.toFixed(2)}ms`);
     
     setTimeout(cleanupCaches, 6 * 60 * 60 * 1000); // Run every 6 hours
 }
@@ -142,9 +166,35 @@ function containsAnyLoop(text, keywords) {
 // Logger helper function
 function logDebug(section, message, data = null) {
     const timestamp = new Date().toISOString();
-    console.log(`[${timestamp}] [${section}] ${message}`);
+    const startTime = process.hrtime();
+    
+    // Determine log level and format
+    let level = '✓';  // Default: OK
+    let color = '';
+    
+    if (section.includes('ERROR')) {
+        level = '✗';  // ERROR
+        color = '\x1b[31m'; // Red
+    } else if (section.includes('WARN')) {
+        level = '⚠';  // WARNING
+        color = '\x1b[33m'; // Yellow
+    }
+    
+    const resetColor = '\x1b[0m';
+    
+    // Log the message
+    console.log(`${color}[${timestamp}] [${level}] [${section}] ${message}${resetColor}`);
+    
+    // Log additional data if provided
     if (data) {
         console.log(JSON.stringify(data, null, 2));
+    }
+    
+    // Calculate and log response time for certain operations
+    if (message.includes('response') || section.includes('SEARCH') || section.includes('LOAD')) {
+        const diff = process.hrtime(startTime);
+        const responseTime = (diff[0] * 1e9 + diff[1]) / 1e6; // Convert to ms
+        console.log(`${color}[${timestamp}] [${level}] [${section}_TIME] ${responseTime.toFixed(2)}ms${resetColor}`);
     }
 }
 
@@ -159,9 +209,16 @@ function constructUrl(baseUrl, path) {
 
 // Helper function to extract episodes from a season folder
 async function seasonExtractor(url, provider, seasonNum) {
+    const timeoutDuration = 15000; // 15 seconds timeout for season extraction
     logDebug('SEASON', `Extracting episodes from season ${seasonNum} at URL: ${url}`);
     try {
-        const response = await axios.get(url);
+        // Add timeout to avoid hanging requests
+        const response = await Promise.race([
+            axios.get(url, { timeout: timeoutDuration }),
+            new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('Timeout extracting season')), timeoutDuration)
+            )
+        ]);
         const $ = cheerio.load(response.data);
         const episodes = [];
         let episodeNum = 0;
@@ -190,9 +247,16 @@ async function seasonExtractor(url, provider, seasonNum) {
 
 // Function to fetch catalog entries from a specific category
 async function fetchCategoryContent(pathUrl, provider) {
+    const timeoutDuration = 10000; // 10 seconds timeout for category content
     logDebug('CATEGORY', `Fetching category content from: ${provider.name}, path: ${pathUrl}`);
     try {
-        const response = await axios.get(`${provider.mainUrl}/${provider.serverName}/${pathUrl}`);
+        // Add timeout to avoid hanging requests
+        const response = await Promise.race([
+            axios.get(`${provider.mainUrl}/${provider.serverName}/${pathUrl}`, { timeout: timeoutDuration }),
+            new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('Timeout fetching category')), timeoutDuration)
+            )
+        ]);
         logDebug('CATEGORY', `Response status: ${response.status} for ${pathUrl}`);
         
         const $ = cheerio.load(response.data);
@@ -224,8 +288,9 @@ async function fetchCategoryContent(pathUrl, provider) {
 }
 
 // Search implementation
-async function search(query, provider) {
-    logDebug('SEARCH', `Searching for "${query}" in provider: ${provider.name}`);
+async function search(query, provider, extendedTimeout = false) {
+    const timeoutDuration = extendedTimeout ? 15000 : 5000; // Use 15 seconds for extended timeout
+    logDebug('SEARCH', `Searching for "${query}" in provider: ${provider.name}${extendedTimeout ? ' with extended timeout' : ''}`);
     
     const cacheKey = `${provider.name}:${query}`;
     if (searchCache.has(cacheKey) && isCacheValid('search', cacheKey)) {
@@ -238,7 +303,7 @@ async function search(query, provider) {
         
         if (query) {
             // Use search API for query with timeout
-            logDebug('SEARCH', `Using search API for query: "${query}"`);
+            logDebug('SEARCH', `Using search API for query: "${query}" (timeout: ${timeoutDuration}ms)`);
             const body = JSON.stringify({
                 action: "get",
                 search: {
@@ -251,10 +316,10 @@ async function search(query, provider) {
             const response = await Promise.race([
                 axios.post(`${provider.mainUrl}/${provider.serverName}/`, body, {
                     headers: { 'Content-Type': 'application/json' },
-                    timeout: 5000 // 5 second timeout
+                    timeout: timeoutDuration
                 }),
                 new Promise((_, reject) => 
-                    setTimeout(() => reject(new Error('Timeout')), 5000)
+                    setTimeout(() => reject(new Error('Timeout')), timeoutDuration)
                 )
             ]);
 
@@ -295,12 +360,12 @@ async function search(query, provider) {
         searchCache.set(cacheKey, results);
         updateCacheTimestamp('search', cacheKey);
         return results;
-    } catch (error) {
+    } catch (error) {        
         logDebug('SEARCH_ERROR', `Error in search for "${query}"`, { error: error.message });
         
         // Return cached results even if expired in case of error
         if (searchCache.has(cacheKey)) {
-            logDebug('SEARCH_CACHE', `Returning expired cache for "${query}" due to error`);
+            logDebug('SEARCH_WARN', `Returning expired cache for "${query}" due to error`);
             return searchCache.get(cacheKey);
         }
         
@@ -310,32 +375,71 @@ async function search(query, provider) {
 
 // Parallel search across all providers
 async function searchAllProviders(query, type) {
+    const startTime = process.hrtime();
+    logDebug('SEARCH', `Starting parallel search for "${query}" (type: ${type}) across all providers`);
+    
+    // Initial search with standard timeout
+    let flatResults = await performParallelSearch(query, type, false);
+    
+    // If no results found, try again with extended timeout
+    if (flatResults.length === 0 && query) {
+        logDebug('SEARCH_WARN', `No results found with standard timeout, retrying with extended timeout`);
+        flatResults = await performParallelSearch(query, type, true);
+    }
+    
+    const diff = process.hrtime(startTime);
+    const totalTime = (diff[0] * 1e9 + diff[1]) / 1e6; // Convert to ms
+    logDebug('SEARCH', `Completed search with ${flatResults.length} total results in ${totalTime.toFixed(2)}ms`);
+    
+    return flatResults;
+}
+
+// Helper function to perform the actual parallel search
+async function performParallelSearch(query, type, extendedTimeout) {
     const searchPromises = Object.entries(PROVIDERS)
         .filter(([_, provider]) => provider.supportedTypes.includes(type))
         .map(async ([providerId, provider]) => {
             try {
-                const results = await search(query, provider);
+                const providerStartTime = process.hrtime();
+                const results = await search(query, provider, extendedTimeout);
+                
+                const diff = process.hrtime(providerStartTime);
+                const responseTime = (diff[0] * 1e9 + diff[1]) / 1e6; // Convert to ms
+                
+                if (results.length > 0) {
+                    logDebug('SEARCH', `Provider ${providerId} returned ${results.length} results in ${responseTime.toFixed(2)}ms${extendedTimeout ? ' (extended timeout)' : ''}`);
+                } else {
+                    logDebug('SEARCH_WARN', `Provider ${providerId} returned no results in ${responseTime.toFixed(2)}ms${extendedTimeout ? ' (extended timeout)' : ''}`);
+                }
+                
                 return results.map(result => ({
                     ...result,
                     providerId
                 }));
             } catch (error) {
-                logDebug('SEARCH_ERROR', `Error searching provider ${providerId}`, { error: error.message });
+                logDebug('SEARCH_ERROR', `Error searching provider ${providerId}${extendedTimeout ? ' with extended timeout' : ''}`, { error: error.message });
                 return [];
             }
         });
-
+        
     const allResults = await Promise.all(searchPromises);
     return allResults.flat();
 }
 
 // Load content implementation
 async function load(url, provider) {
+    const timeoutDuration = 15000; // 15 seconds timeout for loading content
     logDebug('LOAD', `Loading content from URL: ${url} in provider: ${provider.name}`);
     
     try {
         const fullUrl = constructUrl(provider.mainUrl, url);
-        const response = await axios.get(fullUrl);
+        // Add timeout to avoid hanging requests
+        const response = await Promise.race([
+            axios.get(fullUrl, { timeout: timeoutDuration }),
+            new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('Timeout loading content')), timeoutDuration)
+            )
+        ]);
         logDebug('LOAD', `Load response status: ${response.status}`);
         
         const $ = cheerio.load(response.data);
@@ -469,9 +573,16 @@ async function load(url, provider) {
 
 // Helper function to fetch meta information from Stremio
 async function fetchStremioMeta(type, imdbId) {
+    const timeoutDuration = 5000; // 5 seconds timeout for Stremio Meta API
     logDebug('STREMIO_META', `Fetching Stremio meta for ${type}/${imdbId}`);
     try {
-        const response = await axios.get(`${STREMIO_METAHUB_URL}/meta/${type}/${imdbId}.json`);
+        // Add timeout to avoid hanging requests
+        const response = await Promise.race([
+            axios.get(`${STREMIO_METAHUB_URL}/meta/${type}/${imdbId}.json`, { timeout: timeoutDuration }),
+            new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('Timeout fetching Stremio meta')), timeoutDuration)
+            )
+        ]);
         if (response.data && response.data.meta) {
             logDebug('STREMIO_META', `Successfully fetched meta for ${imdbId}: ${response.data.meta.name}`);
             return response.data.meta;
@@ -797,10 +908,23 @@ module.exports = addonInterface;
 if (require.main === module) {
     // Create and start the HTTP server
     const server = http.createServer((req, res) => {
+        const startTime = process.hrtime();
+        
+        // Log the request
+        const reqUrl = url.parse(req.url);
+        logDebug('SERVER', `${req.method} ${reqUrl.pathname}`);
+        
+        // Response handler to capture timing
+        const originalEnd = res.end;
+        res.end = function() {
+            const diff = process.hrtime(startTime);
+            const responseTime = (diff[0] * 1e9 + diff[1]) / 1e6; // Convert to ms
+            logDebug('SERVER', `Response ${res.statusCode} sent in ${responseTime.toFixed(2)}ms`);
+            return originalEnd.apply(this, arguments);
+        };
+        
+        // Process the request
         addonInterface(req, res);
     });
 
-    server.listen(7000, () => {
-        console.log('Addon running at: http://127.0.0.1:7000');
-    });
 }
