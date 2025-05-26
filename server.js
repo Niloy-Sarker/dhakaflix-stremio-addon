@@ -7,6 +7,23 @@ const url = require('url');
 // Stremio Meta API configuration
 const STREMIO_METAHUB_URL = 'https://v3-cinemeta.strem.io';
 
+// Timeout configurations
+const DEFAULT_TIMEOUTS = {
+    search: 5000,        // 5 seconds for normal search
+    extendedSearch: 15000, // 15 seconds for extended search
+    load: 15000,         // 15 seconds for loading content
+    stremioMeta: 5000    // 5 seconds for Stremio Meta API
+};
+
+// Provider-specific timeout configurations
+const PROVIDER_TIMEOUTS = {
+    dhakaflix7: {
+        search: 10000,           // 10 seconds for dhakaflix7 search (slower server)
+        extendedSearch: 25000,   // 25 seconds for dhakaflix7 extended search
+        load: 25000             // 25 seconds for content loading
+    }
+};
+
 // Provider configurations
 const PROVIDERS = {
     dhakaflix14: {
@@ -207,6 +224,58 @@ function constructUrl(baseUrl, path) {
     return url;
 }
 
+// Helper function to extract movie title and year from filename
+function extractMovieTitleAndYear(filename) {
+    // First try to match "Movie Name (YYYY)" pattern
+    let match = filename.match(/^(.+?)\s*\((\d{4})\)/);
+    
+    if (match) {
+        return {
+            title: match[1].trim(),
+            year: parseInt(match[2])
+        };
+    }
+    
+    // Try to find year anywhere in the filename (common in movie filenames)
+    match = filename.match(/\b(19\d{2}|20\d{2})\b/);
+    if (match) {
+        const year = parseInt(match[1]);
+        // Extract title - everything before the year or up to some common separator
+        const titleMatch = filename.match(/^(.+?)(?:\s*[\(\[\-\|]|\s+\d{4}|$)/);
+        const title = titleMatch ? titleMatch[1].trim() : filename;
+        
+        return {
+            title: title,
+            year: year
+        };
+    }
+    
+    // If no match, try to extract just the title before common separators
+    match = filename.match(/^(.+?)(?:\s*[\(\[\-\|]|(?:\d{3,4}p)|(?:x\d{3}))/);
+    
+    if (match) {
+        return {
+            title: match[1].trim(),
+            year: null
+        };
+    }
+    
+    // Last resort: return the whole name with extension removed
+    match = filename.match(/^(.+)\.(?:mkv|mp4|avi|webm)$/i);
+    
+    if (match) {
+        return {
+            title: match[1].trim(),
+            year: null
+        };
+    }
+    
+    return {
+        title: filename,
+        year: null
+    };
+}
+
 // Helper function to extract episodes from a season folder
 async function seasonExtractor(url, provider, seasonNum) {
     const timeoutDuration = 15000; // 15 seconds timeout for season extraction
@@ -289,8 +358,13 @@ async function fetchCategoryContent(pathUrl, provider) {
 
 // Search implementation
 async function search(query, provider, extendedTimeout = false) {
-    const timeoutDuration = extendedTimeout ? 15000 : 5000; // Use 15 seconds for extended timeout
-    logDebug('SEARCH', `Searching for "${query}" in provider: ${provider.name}${extendedTimeout ? ' with extended timeout' : ''}`);
+    // Get provider-specific timeout or use default
+    const providerTimeouts = PROVIDER_TIMEOUTS[provider.serverName.toLowerCase()] || DEFAULT_TIMEOUTS;
+    const timeoutDuration = extendedTimeout ? 
+        (providerTimeouts.extendedSearch || DEFAULT_TIMEOUTS.extendedSearch) : 
+        (providerTimeouts.search || DEFAULT_TIMEOUTS.search);
+    
+    logDebug('SEARCH', `Searching for "${query}" in provider: ${provider.name}${extendedTimeout ? ' with extended timeout' : ''} (timeout: ${timeoutDuration}ms)`);
     
     const cacheKey = `${provider.name}:${query}`;
     if (searchCache.has(cacheKey) && isCacheValid('search', cacheKey)) {
@@ -300,8 +374,7 @@ async function search(query, provider, extendedTimeout = false) {
 
     try {
         let results = [];
-        
-        if (query) {
+          if (query) {
             // Use search API for query with timeout
             logDebug('SEARCH', `Using search API for query: "${query}" (timeout: ${timeoutDuration}ms)`);
             const body = JSON.stringify({
@@ -428,8 +501,11 @@ async function performParallelSearch(query, type, extendedTimeout) {
 
 // Load content implementation
 async function load(url, provider) {
-    const timeoutDuration = 15000; // 15 seconds timeout for loading content
-    logDebug('LOAD', `Loading content from URL: ${url} in provider: ${provider.name}`);
+    // Get provider-specific timeout or use default
+    const providerTimeouts = PROVIDER_TIMEOUTS[provider.serverName.toLowerCase()] || DEFAULT_TIMEOUTS;
+    const timeoutDuration = providerTimeouts.load || DEFAULT_TIMEOUTS.load;
+    
+    logDebug('LOAD', `Loading content from URL: ${url} in provider: ${provider.name} (timeout: ${timeoutDuration}ms)`);
     
     try {
         const fullUrl = constructUrl(provider.mainUrl, url);
@@ -525,38 +601,66 @@ async function load(url, provider) {
                     episodes: episodes
                 };
             }
-        } else {
-            // For movies, first check if we're already at a video file
-            const directVideoLink = tableRows.find('td.fb-n > a[href$=".mkv"], td.fb-n > a[href$=".mp4"]');
-            if (directVideoLink.length > 0) {
-                const name = directVideoLink.text();
-                const link = constructUrl(provider.mainUrl, directVideoLink.attr('href'));
-                logDebug('LOAD', `Found direct movie file: ${name}, link: ${link}`);
-                return {
-                    type: 'movie',
-                    name,
-                    poster: imageLink,
-                    url: link
-                };
-            }
-
-            // If no direct video file found, this might be a folder - try to find video files inside
+        } else {            // For movies, first check if we're already at a video file
+            const directVideoLinks = tableRows.find('td.fb-n > a[href$=".mkv"], td.fb-n > a[href$=".mp4"]');
+            if (directVideoLinks.length > 0) {
+                // Collect all video files
+                const videoFiles = [];
+                directVideoLinks.each((_, element) => {
+                    const videoElement = $(element);
+                    const name = videoElement.text();
+                    const link = constructUrl(provider.mainUrl, videoElement.attr('href'));
+                    videoFiles.push({
+                        name,
+                        url: link,
+                        hasDualAudio: name.includes('Dual') || name.includes('Dual Audio'),
+                        hasSubtitles: name.includes('ESub') || name.includes('Sub')
+                    });
+                });
+                
+                if (videoFiles.length > 0) {
+                    // Use first video name as main name for the content
+                    const name = videoFiles[0].name;
+                    logDebug('LOAD', `Found ${videoFiles.length} direct movie files. Primary: ${name}`);
+                    return {
+                        type: 'movie',
+                        name,
+                        poster: imageLink,
+                        videoFiles // Return all video files
+                    };
+                }
+            }            // If no direct video file found, this might be a folder - try to find video files inside
             try {
                 const folderResponse = await axios.get(fullUrl);
                 const folder$ = cheerio.load(folderResponse.data);
                 const videoLinks = folder$('td.fb-n > a[href$=".mkv"], td.fb-n > a[href$=".mp4"]');
                 
                 if (videoLinks.length > 0) {
-                    const firstVideo = videoLinks.first();
-                    const name = firstVideo.text();
-                    const link = constructUrl(provider.mainUrl, firstVideo.attr('href'));
-                    logDebug('LOAD', `Found movie in folder: ${name}, link: ${link}`);
-                    return {
-                        type: 'movie',
-                        name,
-                        poster: imageLink,
-                        url: link
-                    };
+                    // Collect all video files in the folder
+                    const videoFiles = [];
+                    videoLinks.each((_, element) => {
+                        const videoElement = folder$(element);
+                        const name = videoElement.text();
+                        const link = constructUrl(provider.mainUrl, videoElement.attr('href'));
+                        videoFiles.push({
+                            name,
+                            url: link,
+                            hasDualAudio: name.includes('Dual') || name.includes('Dual Audio'),
+                            hasSubtitles: name.includes('ESub') || name.includes('Sub')
+                        });
+                    });
+                    
+                    if (videoFiles.length > 0) {
+                        // Use first video name as main name for the content
+                        const name = videoFiles[0].name;
+                        logDebug('LOAD', `Found ${videoFiles.length} movie files in folder. Primary: ${name}`);
+                        return {
+                            type: 'movie',
+                            name,
+                            poster: imageLink,
+                            videoFiles // Return all video files
+                        };
+                    }
                 }
             } catch (folderError) {
                 logDebug('LOAD_ERROR', `Error loading folder content: ${url}`, { error: folderError.message });
@@ -582,10 +686,11 @@ async function fetchStremioMeta(type, imdbId) {
             new Promise((_, reject) => 
                 setTimeout(() => reject(new Error('Timeout fetching Stremio meta')), timeoutDuration)
             )
-        ]);
-        if (response.data && response.data.meta) {
-            logDebug('STREMIO_META', `Successfully fetched meta for ${imdbId}: ${response.data.meta.name}`);
-            return response.data.meta;
+        ]);        if (response.data && response.data.meta) {
+            const meta = response.data.meta;
+            const yearInfo = meta.year ? ` (${meta.year})` : '';
+            logDebug('STREMIO_META', `Successfully fetched meta for ${imdbId}: ${meta.name}${yearInfo}`);
+            return meta;
         }
         logDebug('STREMIO_META_ERROR', `No meta found for ${imdbId}`);
         return null;
@@ -612,9 +717,15 @@ builder.defineMetaHandler(async ({ type, id }) => {
         // Search all providers in parallel
         logDebug('META', `Searching all providers for: ${meta.name}`);
         const results = await searchAllProviders(meta.name, type);
+          // Find the best match across all results using similar scoring as stream handler
+        let bestMatch = null;
+        let bestMatchScore = 0;
         
-        // Find the best match across all results
-        const matchingResult = results.find(result => {
+        for (const result of results) {
+            if (result.type !== type) continue;
+            
+            const { year: fileYear } = extractMovieTitleAndYear(result.name);
+            
             const cleanName = result.name.toLowerCase()
                 .replace(/[^\w\s]/g, '')
                 .replace(/\s+/g, ' ')
@@ -623,11 +734,47 @@ builder.defineMetaHandler(async ({ type, id }) => {
                 .replace(/[^\w\s]/g, '')
                 .replace(/\s+/g, ' ')
                 .trim();
-            return cleanName.includes(cleanMetaName) || cleanMetaName.includes(cleanName);
-        });
+            
+            // Calculate match score (higher is better)
+            let score = 0;
+            
+            // Base score for title match
+            if (cleanName.includes(cleanMetaName) || cleanMetaName.includes(cleanName)) {
+                score += 10;
+                
+                // Exact title match gets higher score
+                if (cleanName === cleanMetaName) {
+                    score += 5;
+                    logDebug('META', `Exact title match found for "${result.name}"`);
+                }
+                
+                // Bonus points if year matches the IMDB year
+                if (fileYear && meta.year) {
+                    const yearDiff = Math.abs(fileYear - meta.year);
+                    
+                    if (yearDiff === 0) {
+                        // Exact year match
+                        score += 10;
+                        logDebug('META', `Year match found: ${fileYear} === ${meta.year} for "${result.name}"`);
+                    } else if (yearDiff === 1) {
+                        // Off by one year (common for early/late releases)
+                        score += 3;
+                        logDebug('META', `Near year match found: ${fileYear} vs ${meta.year} (diff: ${yearDiff}) for "${result.name}"`);
+                    }
+                }
+                
+                // Update best match if this score is higher
+                if (score > bestMatchScore) {
+                    bestMatchScore = score;
+                    bestMatch = result;
+                }
+            }
+        }
+        
+        const matchingResult = bestMatch;
 
         if (matchingResult) {
-            logDebug('META', `Found match in ${matchingResult.providerId}: ${matchingResult.name}`);
+            logDebug('META', `Found match in ${matchingResult.providerId}: ${matchingResult.name} (score: ${bestMatchScore})`);
             const provider = PROVIDERS[matchingResult.providerId];
             const content = await load(matchingResult.url, provider);
             
@@ -650,6 +797,111 @@ builder.defineMetaHandler(async ({ type, id }) => {
 
                 logDebug('META', `Returning meta object for: ${content.name}`);
                 return { meta: metaObject };
+            }
+        }
+        
+        // Try fallback search for movies if no match found with full title
+        if (type === 'movie') {
+            logDebug('META', `No match found with full title. Trying fallback search for: ${meta.name}`);
+            // Try simplified search using just the first part of the title
+            const simplified = meta.name.includes(':') 
+                ? meta.name.split(':')[0].trim() 
+                : meta.name.split(/\s+/g).slice(0, 2).join(' ');
+            
+            if (simplified !== meta.name && simplified.length > 0) {
+                logDebug('META', `Using simplified title for fallback search: "${simplified}"`);
+                
+                // Search all providers with simplified title
+                for (const [providerId, provider] of Object.entries(PROVIDERS)) {
+                    if (!provider.supportedTypes.includes(type)) continue;
+                    
+                    try {
+                        const fallbackResults = await search(simplified, provider);
+                        let bestFallbackMatch = null;
+                        let bestFallbackScore = 0;
+                        
+                        for (const result of fallbackResults) {
+                            if (result.type !== type) continue;
+                            
+                            const cleanResultName = result.name.toLowerCase()
+                                .replace(/[^\w\s]/g, '')
+                                .replace(/\s+/g, ' ')
+                                .trim();
+                            
+                            const cleanSimplifiedName = simplified.toLowerCase()
+                                .replace(/[^\w\s]/g, '')
+                                .replace(/\s+/g, ' ')
+                                .trim();
+                            
+                            // Calculate match score
+                            let score = 0;
+                            
+                            if (cleanResultName.includes(cleanSimplifiedName) || cleanSimplifiedName.includes(cleanResultName)) {
+                                score += 10;
+                                
+                                // Extract year information
+                                const { year } = extractMovieTitleAndYear(result.name);
+                                
+                                if (cleanResultName === cleanSimplifiedName) {
+                                    score += 5;
+                                }
+                                
+                                // Check if the full title is in the result name
+                                const cleanFullName = meta.name.toLowerCase()
+                                    .replace(/[^\w\s]/g, '')
+                                    .replace(/\s+/g, ' ')
+                                    .trim();
+                                
+                                if (cleanResultName.includes(cleanFullName)) {
+                                    score += 8;
+                                    logDebug('META', `Fallback result contains full title: "${result.name}"`);
+                                }
+                                
+                                // Bonus points if year matches
+                                if (year && meta.year) {
+                                    const yearDiff = Math.abs(year - meta.year);
+                                    
+                                    if (yearDiff === 0) {
+                                        score += 10;
+                                        logDebug('META', `Year match in fallback: ${year} === ${meta.year} for "${result.name}"`);
+                                    } else if (yearDiff === 1) {
+                                        score += 3;
+                                    }
+                                }
+                                
+                                if (score > bestFallbackScore) {
+                                    bestFallbackScore = score;
+                                    bestFallbackMatch = result;
+                                }
+                            }
+                        }
+                        
+                        // Use best fallback match if found
+                        if (bestFallbackMatch) {
+                            logDebug('META', `Found fallback match in ${providerId}: ${bestFallbackMatch.name} (score: ${bestFallbackScore})`);
+                            
+                            // Add provider ID to the result
+                            bestFallbackMatch.providerId = providerId;
+                            
+                            const content = await load(bestFallbackMatch.url, provider);
+                            
+                            if (content) {
+                                const metaObject = {
+                                    id: `${providerId}:${bestFallbackMatch.url}`,
+                                    type: content.type,
+                                    name: content.name,
+                                    poster: content.poster
+                                };
+                                
+                                logDebug('META', `Fallback search successful. Returning meta for: ${content.name}`);
+                                return { meta: metaObject };
+                            }
+                        }
+                    } catch (error) {
+                        logDebug('META_ERROR', `Error in fallback search for provider ${providerId}`, { error: error.message });
+                        continue;
+                    }
+                }
             }
         }
 
@@ -796,28 +1048,90 @@ builder.defineStreamHandler(async ({ type, id }) => {
             logDebug('STREAM', `Searching provider ${providerId} for: ${meta.name}`);
             try {
                 const results = await search(meta.name, provider);
+                  // Filter results to find closest match using scoring system
+                let bestMatch = null;
+                let bestMatchScore = 0;
                 
-                // Filter results to find closest match
-                const matchingResult = results.find(result => {
-                    // Only match results of the same type
-                    if (result.type !== type) return false;
-                    
-                    const cleanName = result.name.toLowerCase()
-                        .replace(/[^\w\s]/g, '')
-                        .replace(/\s+/g, ' ')
-                        .trim();
-                    const cleanMetaName = meta.name.toLowerCase()
-                        .replace(/[^\w\s]/g, '')
-                        .replace(/\s+/g, ' ')
-                        .trim();
-                    return cleanName.includes(cleanMetaName) || cleanMetaName.includes(cleanName);
-                });
+                // Only for movies, we'll use a scoring system with year matching
+                if (type === 'movie') {                    for (const result of results) {
+                        if (result.type !== type) continue;
+                        
+                        // Extract title and year info from file name for better comparison
+                        const { title: fileTitle, year: fileYear } = extractMovieTitleAndYear(result.name);
+                        
+                        const cleanName = result.name.toLowerCase()
+                            .replace(/[^\w\s]/g, '')
+                            .replace(/\s+/g, ' ')
+                            .trim();
+                        const cleanMetaName = meta.name.toLowerCase()
+                            .replace(/[^\w\s]/g, '')
+                            .replace(/\s+/g, ' ')
+                            .trim();
+                            
+                        // Calculate match score (higher is better)
+                        let score = 0;
+                        
+                        // Base score for title match
+                        if (cleanName.includes(cleanMetaName) || cleanMetaName.includes(cleanName)) {
+                            score += 10;
+                            
+                            // Exact title match gets higher score
+                            if (cleanName === cleanMetaName) {
+                                score += 5;
+                                logDebug('STREAM', `Exact title match found for "${result.name}"`);
+                            }
+                            
+                            // Bonus points if year matches the IMDB year
+                            if (fileYear && meta.year) {
+                                const yearDiff = Math.abs(fileYear - meta.year);
+                                
+                                if (yearDiff === 0) {
+                                    // Exact year match
+                                    score += 10; // Increased from 5 to 10 for exact matches
+                                    logDebug('STREAM', `Year match found: ${fileYear} === ${meta.year} for "${result.name}"`);
+                                } else if (yearDiff === 1) {
+                                    // Off by one year (common for early/late releases)
+                                    score += 3;
+                                    logDebug('STREAM', `Near year match found: ${fileYear} vs ${meta.year} (diff: ${yearDiff}) for "${result.name}"`);
+                                }
+                            }
+                            
+                            // Update best match if this score is higher
+                            if (score > bestMatchScore) {
+                                bestMatchScore = score;
+                                bestMatch = result;
+                            }
+                        }
+                    }
+                      if (meta.year) {
+                        logDebug('STREAM', `Best match score: ${bestMatchScore}${bestMatch ? ` for "${bestMatch.name}"` : ''} (IMDB Year: ${meta.year})`);
+                    } else {
+                        logDebug('STREAM', `Best match score: ${bestMatchScore}${bestMatch ? ` for "${bestMatch.name}"` : ''} (No IMDB year available)`);
+                    }
+                } else {
+                    // Original method for series - first match that satisfies condition
+                    bestMatch = results.find(result => {
+                        // Only match results of the same type
+                        if (result.type !== type) return false;
+                        
+                        const cleanName = result.name.toLowerCase()
+                            .replace(/[^\w\s]/g, '')
+                            .replace(/\s+/g, ' ')
+                            .trim();
+                        const cleanMetaName = meta.name.toLowerCase()
+                            .replace(/[^\w\s]/g, '')
+                            .replace(/\s+/g, ' ')
+                            .trim();
+                        return cleanName.includes(cleanMetaName) || cleanMetaName.includes(cleanName);
+                    });
+                }
+                
+                const matchingResult = bestMatch;
 
                 if (matchingResult) {
                     logDebug('STREAM', `Found match in ${providerId}: ${matchingResult.name}`);
                     const content = await load(matchingResult.url, provider);
-                    
-                    if (content) {
+                      if (content) {
                         if (type === 'series' && content.episodes) {
                             // For series, add all episode streams
                             content.episodes.forEach(episode => {
@@ -826,8 +1140,26 @@ builder.defineStreamHandler(async ({ type, id }) => {
                                     url: episode.url
                                 });
                             });
+                        } else if (content.videoFiles) {
+                            // For movies with multiple video files
+                            content.videoFiles.forEach(videoFile => {
+                                let title = videoFile.name;
+                                
+                                // Add informative tags to the stream title
+                                // if (videoFile.hasDualAudio) {
+                                //     title = `[Dual Audio] ${title}`;
+                                // }
+                                // if (videoFile.hasSubtitles) {
+                                //     title = `[Sub] ${title}`;
+                                // }
+                                
+                                allStreams.push({
+                                    title: title,
+                                    url: videoFile.url
+                                });
+                            });
                         } else if (content.url) {
-                            // For movies or direct episode links
+                            // Fallback for direct episode links or old format
                             allStreams.push({
                                 title: matchingResult.name,
                                 url: content.url
@@ -839,16 +1171,111 @@ builder.defineStreamHandler(async ({ type, id }) => {
                 logDebug('STREAM_ERROR', `Error searching provider ${providerId}`, { error: error.message });
                 continue;
             }
-        }
-
-        if (allStreams.length > 0) {
+        }        if (allStreams.length > 0) {
             logDebug('STREAM', `Found ${allStreams.length} total streams across all providers`);
             streamCache.set(id, allStreams);
             updateCacheTimestamp('stream', id);
             return { streams: allStreams };
         }
 
-        logDebug('STREAM_ERROR', `No streams found for ${meta.name} in any provider`);
+        // Fallback search for movies only
+        if (type === 'movie') {
+            logDebug('STREAM', `No streams found with full title. Trying fallback search for movie: ${meta.name}`);
+            // Try simplified search using just the first part of the title
+            // Handle different title formats - either with ":" or just get the main title before any special characters
+            const simplified = meta.name.includes(':') 
+                ? meta.name.split(':')[0].trim() 
+                : meta.name.split(/\s+/g).slice(0, 2).join(' '); // Take first 1-2 words as simplified title
+            
+            if (simplified !== meta.name && simplified.length > 0) {
+                logDebug('STREAM', `Using simplified title for fallback search: "${simplified}"`);
+                // Search with simplified title across all providers
+                for (const [providerId, provider] of Object.entries(PROVIDERS)) {
+                    if (!provider.supportedTypes.includes(type)) continue;
+                    
+                    try {
+                        const fallbackResults = await search(simplified, provider);
+                        
+                        // Add year-based matching for better accuracy
+                        let bestMatch = null;
+                        let bestMatchScore = 0;
+                        
+                        for (const result of fallbackResults) {
+                            if (result.type !== type) continue;
+                            
+                            const cleanResultName = result.name.toLowerCase()
+                                .replace(/[^\w\s]/g, '')
+                                .replace(/\s+/g, ' ')
+                                .trim();
+                                
+                            const cleanMetaName = simplified.toLowerCase()
+                                .replace(/[^\w\s]/g, '')
+                                .replace(/\s+/g, ' ')
+                                .trim();
+                            
+                            // Calculate match score (higher is better)
+                            let score = 0;                                // Base score for title match
+                                if (cleanResultName.includes(cleanMetaName) || cleanMetaName.includes(cleanResultName)) {
+                                    score += 10;
+                                    
+                                    // Extract year information
+                                    const { title, year } = extractMovieTitleAndYear(result.name);
+                                    
+                                    // Exact title match gets higher score
+                                    if (cleanResultName === cleanMetaName) {
+                                        score += 5;
+                                        logDebug('STREAM', `Exact title match found for "${result.name}"`);
+                                    }
+                                    
+                                    // Bonus points if year matches
+                                    if (year && meta.year) {
+                                        const yearDiff = Math.abs(year - meta.year);
+                                        
+                                        if (yearDiff === 0) {
+                                            // Exact year match
+                                            score += 10; // Higher score for exact match
+                                            logDebug('STREAM', `Year match found: ${year} === ${meta.year} for "${result.name}"`);
+                                        } else if (yearDiff === 1) {
+                                            // Off by one year (common for early/late releases)
+                                            score += 3;
+                                            logDebug('STREAM', `Near year match found: ${year} vs ${meta.year} (diff: ${yearDiff})`);
+                                        }
+                                    }
+                                
+                                // Update best match if this score is higher
+                                if (score > bestMatchScore) {
+                                    bestMatchScore = score;
+                                    bestMatch = result;
+                                }
+                            }
+                        }
+                        
+                        // Use best match if found
+                        if (bestMatch) {
+                            logDebug('STREAM', `Found fallback match in ${providerId}: ${bestMatch.name} (score: ${bestMatchScore})`);
+                            const content = await load(bestMatch.url, provider);
+                            
+                            if (content && content.url) {
+                                const stream = {
+                                    title: bestMatch.name,
+                                    url: content.url
+                                };
+                                
+                                logDebug('STREAM', `Fallback search successful. Found stream: ${stream.title}`);
+                                streamCache.set(id, [stream]);
+                                updateCacheTimestamp('stream', id);
+                                return { streams: [stream] };
+                            }
+                        }
+                    } catch (error) {
+                        logDebug('STREAM_ERROR', `Error in fallback search for provider ${providerId}`, { error: error.message });
+                        continue;
+                    }
+                }
+            }
+        }
+
+        logDebug('STREAM_ERROR', `No streams found for ${meta.name} in any provider, fallback search also failed`);
         return { streams: [] };
     }
 
