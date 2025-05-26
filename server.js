@@ -1249,22 +1249,36 @@ builder.defineStreamHandler(async ({ type, id }) => {
                                 }
                             }
                         }
-                        
-                        // Use best match if found
+                          // Use best match if found
                         if (bestMatch) {
                             logDebug('STREAM', `Found fallback match in ${providerId}: ${bestMatch.name} (score: ${bestMatchScore})`);
                             const content = await load(bestMatch.url, provider);
                             
-                            if (content && content.url) {
-                                const stream = {
-                                    title: bestMatch.name,
-                                    url: content.url
-                                };
+                            if (content) {
+                                const streams = [];
                                 
-                                logDebug('STREAM', `Fallback search successful. Found stream: ${stream.title}`);
-                                streamCache.set(id, [stream]);
-                                updateCacheTimestamp('stream', id);
-                                return { streams: [stream] };
+                                if (content.videoFiles && content.videoFiles.length > 0) {
+                                    // Handle movies with multiple video files
+                                    content.videoFiles.forEach(videoFile => {
+                                        streams.push({
+                                            title: videoFile.name,
+                                            url: videoFile.url
+                                        });
+                                    });
+                                } else if (content.url) {
+                                    // Handle direct URL content
+                                    streams.push({
+                                        title: bestMatch.name,
+                                        url: content.url
+                                    });
+                                }
+                                
+                                if (streams.length > 0) {
+                                    logDebug('STREAM', `Fallback search successful. Found ${streams.length} stream(s): ${streams[0].title}`);
+                                    streamCache.set(id, streams);
+                                    updateCacheTimestamp('stream', id);
+                                    return { streams };
+                                }
                             }
                         }
                     } catch (error) {
