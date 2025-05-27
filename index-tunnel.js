@@ -13,7 +13,7 @@ serveHTTP(addonInterface, { port: process.env.PORT || 7001 })
         // Create a tunnel to expose the local server
         try {            const tunnel = await localtunnel({ 
                 port: process.env.PORT || 7001,
-                subdomain: 'yourname' // Using your a custom subdomain
+                subdomain: 'yourname' // Use your custom subdomain
             });
             console.log('- Public addon URL: ' + tunnel.url);
             console.log('===================================================\n');
