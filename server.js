@@ -10,8 +10,8 @@ const STREMIO_METAHUB_URL = 'https://v3-cinemeta.strem.io';
 // Timeout configurations
 const DEFAULT_TIMEOUTS = {
     search: 5000,        // 5 seconds for normal search
-    extendedSearch: 15000, // 15 seconds for extended search
-    load: 15000,         // 15 seconds for loading content
+    extendedSearch: 30000, // 30 seconds for extended search
+    load: 20000,         // 20 seconds for loading content
     stremioMeta: 5000    // 5 seconds for Stremio Meta API
 };
 
@@ -242,7 +242,7 @@ function extractMovieTitleAndYear(filename) {
         const year = parseInt(match[1]);
         // Extract title - everything before the year or up to some common separator
         const titleMatch = filename.match(/^(.+?)(?:\s*[\(\[\-\|]|\s+\d{4}|$)/);
-        const title = titleMatch ? titleMatch[1].trim() : filename;
+        const title = titleMatch ? titleMatch[1] : filename;
         
         return {
             title: title,
@@ -432,9 +432,15 @@ async function search(query, provider, extendedTimeout = false) {
         
         searchCache.set(cacheKey, results);
         updateCacheTimestamp('search', cacheKey);
-        return results;
-    } catch (error) {        
-        logDebug('SEARCH_ERROR', `Error in search for "${query}"`, { error: error.message });
+        return results;    } catch (error) {
+        const isTimeout = error.message === 'Timeout' || error.code === 'ECONNABORTED';
+        if (isTimeout) {
+            logDebug('SEARCH_ERROR', `Timeout searching for "${query}" in ${provider.name}`, { error: error.message });
+            // Rethrow timeout errors so they can be caught by performParallelSearch
+            throw error;
+        } else {
+            logDebug('SEARCH_ERROR', `Error in search for "${query}" in ${provider.name}`, { error: error.message });
+        }
         
         // Return cached results even if expired in case of error
         if (searchCache.has(cacheKey)) {
@@ -452,12 +458,15 @@ async function searchAllProviders(query, type) {
     logDebug('SEARCH', `Starting parallel search for "${query}" (type: ${type}) across all providers`);
     
     // Initial search with standard timeout
-    let flatResults = await performParallelSearch(query, type, false);
+    const { results: initialResults, timedOutProviders } = await performParallelSearch(query, type, false);
     
-    // If no results found, try again with extended timeout
-    if (flatResults.length === 0 && query) {
-        logDebug('SEARCH_WARN', `No results found with standard timeout, retrying with extended timeout`);
-        flatResults = await performParallelSearch(query, type, true);
+    let flatResults = initialResults;
+    
+    // If we had timeouts and query exists, retry only those providers with extended timeout
+    if (timedOutProviders.length > 0 && query) {
+        logDebug('SEARCH_WARN', `${timedOutProviders.length} providers timed out (${timedOutProviders.join(', ')}), retrying them with extended timeout`);
+        const { results: retryResults } = await performParallelSearch(query, type, true, timedOutProviders);
+        flatResults = [...initialResults, ...retryResults];
     }
     
     const diff = process.hrtime(startTime);
@@ -468,35 +477,65 @@ async function searchAllProviders(query, type) {
 }
 
 // Helper function to perform the actual parallel search
-async function performParallelSearch(query, type, extendedTimeout) {
-    const searchPromises = Object.entries(PROVIDERS)
-        .filter(([_, provider]) => provider.supportedTypes.includes(type))
-        .map(async ([providerId, provider]) => {
-            try {
-                const providerStartTime = process.hrtime();
-                const results = await search(query, provider, extendedTimeout);
-                
-                const diff = process.hrtime(providerStartTime);
-                const responseTime = (diff[0] * 1e9 + diff[1]) / 1e6; // Convert to ms
-                
-                if (results.length > 0) {
-                    logDebug('SEARCH', `Provider ${providerId} returned ${results.length} results in ${responseTime.toFixed(2)}ms${extendedTimeout ? ' (extended timeout)' : ''}`);
-                } else {
-                    logDebug('SEARCH_WARN', `Provider ${providerId} returned no results in ${responseTime.toFixed(2)}ms${extendedTimeout ? ' (extended timeout)' : ''}`);
-                }
-                
-                return results.map(result => ({
+async function performParallelSearch(query, type, extendedTimeout, specificProviders = null) {    const providers = specificProviders 
+        ? Object.entries(PROVIDERS).filter(([id]) => specificProviders.includes(id))
+        : Object.entries(PROVIDERS);
+        
+    const filteredProviders = providers.filter(([_, provider]) => provider.supportedTypes.includes(type));
+    
+    // Debug log
+    logDebug('SEARCH_DEBUG', `Performing ${extendedTimeout ? 'extended' : 'normal'} search for ${filteredProviders.length} providers: ${filteredProviders.map(([id]) => id).join(', ')}`);
+    
+    const searchPromises = filteredProviders.map(async ([providerId, provider]) => {
+        try {
+            const providerStartTime = process.hrtime();
+            const results = await search(query, provider, extendedTimeout);
+            
+            const diff = process.hrtime(providerStartTime);
+            const responseTime = (diff[0] * 1e9 + diff[1]) / 1e6; // Convert to ms
+            
+            if (results.length > 0) {
+                logDebug('SEARCH', `Provider ${providerId} returned ${results.length} results in ${responseTime.toFixed(2)}ms${extendedTimeout ? ' (extended timeout)' : ''}`);
+            } else {
+                logDebug('SEARCH_WARN', `Provider ${providerId} returned no results in ${responseTime.toFixed(2)}ms${extendedTimeout ? ' (extended timeout)' : ''}`);
+            }
+            
+            return {
+                providerId,
+                timedOut: false,
+                results: results.map(result => ({
                     ...result,
                     providerId
-                }));
-            } catch (error) {
-                logDebug('SEARCH_ERROR', `Error searching provider ${providerId}${extendedTimeout ? ' with extended timeout' : ''}`, { error: error.message });
-                return [];
+                }))
+            };
+        } catch (error) {
+            const isTimeout = error.message === 'Timeout' || error.code === 'ECONNABORTED';
+            if (isTimeout) {
+                logDebug('SEARCH_ERROR', `Provider ${providerId} TIMED OUT${extendedTimeout ? ' with extended timeout' : ''}`);
+                return { providerId, timedOut: true, results: [] };
             }
-        });
-        
+            logDebug('SEARCH_ERROR', `Error searching provider ${providerId}${extendedTimeout ? ' with extended timeout' : ''}`, { error: error.message });
+            return { providerId, timedOut: false, results: [] };
+        }
+    });
+    
     const allResults = await Promise.all(searchPromises);
-    return allResults.flat();
+    
+    // Separate timed out providers and results
+    const timedOutProviders = [];
+    const validResults = [];
+    
+    allResults.forEach(result => {
+        if (result.timedOut) {
+            timedOutProviders.push(result.providerId);
+        }
+        validResults.push(...result.results);
+    });
+    
+    return {
+        results: validResults,
+        timedOutProviders
+    };
 }
 
 // Load content implementation
@@ -717,9 +756,9 @@ builder.defineMetaHandler(async ({ type, id }) => {
         // Search all providers in parallel
         logDebug('META', `Searching all providers for: ${meta.name}`);
         const results = await searchAllProviders(meta.name, type);
-          // Find the best match across all results using similar scoring as stream handler
-        let bestMatch = null;
-        let bestMatchScore = 0;
+        
+        // Find all matches with matching name
+        const matches = [];
         
         for (const result of results) {
             if (result.type !== type) continue;
@@ -735,173 +774,103 @@ builder.defineMetaHandler(async ({ type, id }) => {
                 .replace(/\s+/g, ' ')
                 .trim();
             
-            // Calculate match score (higher is better)
-            let score = 0;
-            
-            // Base score for title match
+            // Check if name matches (either contains the other)
             if (cleanName.includes(cleanMetaName) || cleanMetaName.includes(cleanName)) {
-                score += 10;
-                
-                // Exact title match gets higher score
-                if (cleanName === cleanMetaName) {
-                    score += 5;
-                    logDebug('META', `Exact title match found for "${result.name}"`);
+                // For series, we don't check year since series can span multiple years
+                if (type === 'series') {
+                    logDebug('META', `Series match found: "${result.name}" for "${meta.name}"`);
+                    matches.push(result);
                 }
-                
-                // Bonus points if year matches the IMDB year
-                if (fileYear && meta.year) {
+                // For movies, check year if available
+                else if (fileYear && meta.year) {
                     const yearDiff = Math.abs(fileYear - meta.year);
-                    
-                    if (yearDiff === 0) {
-                        // Exact year match
-                        score += 10;
-                        logDebug('META', `Year match found: ${fileYear} === ${meta.year} for "${result.name}"`);
-                    } else if (yearDiff === 1) {
-                        // Off by one year (common for early/late releases)
-                        score += 3;
-                        logDebug('META', `Near year match found: ${fileYear} vs ${meta.year} (diff: ${yearDiff}) for "${result.name}"`);
+                    if (yearDiff <= 1) { // Accept exact match or off by one year
+                        logDebug('META', `Movie match found: "${result.name}" (${fileYear}) for "${meta.name}" (${meta.year})`);
+                        matches.push(result);
                     }
-                }
-                
-                // Update best match if this score is higher
-                if (score > bestMatchScore) {
-                    bestMatchScore = score;
-                    bestMatch = result;
+                } else {
+                    // If we don't have year information, include it as a potential match
+                    logDebug('META', `Name-only match found: "${result.name}" for "${meta.name}"`);
+                    matches.push(result);
                 }
             }
         }
         
-        const matchingResult = bestMatch;
+        // Process all matching results
+        if (matches.length > 0) {
+            const metaObject = {
+                id: id,
+                type: type,
+                name: meta.name,
+                year: meta.year,
+                poster: meta.poster || meta.background,
+                videos: [] // Will be filled below
+            };
 
-        if (matchingResult) {
-            logDebug('META', `Found match in ${matchingResult.providerId}: ${matchingResult.name} (score: ${bestMatchScore})`);
-            const provider = PROVIDERS[matchingResult.providerId];
-            const content = await load(matchingResult.url, provider);
-            
-            if (content) {
-                const metaObject = {
-                    id: `${matchingResult.providerId}:${matchingResult.url}`,
-                    type: content.type,
-                    name: content.name,
-                    poster: content.poster
-                };
+            // Load content for each match
+            for (const match of matches) {
+                logDebug('META', `Processing match: ${match.providerId}: ${match.name}`);
+                const provider = PROVIDERS[match.providerId];
+                const content = await load(match.url, provider);
+                
+                if (content) {
+                    if (type === 'series' && content.episodes) {
+                        // For series, add all episodes
+                        for (const ep of content.episodes) {
+                            metaObject.videos.push({
+                                id: `${match.providerId}:${ep.url}`,
+                                title: ep.name,
+                                season: ep.season,
+                                episode: ep.episode
+                            });
+                        }
+                    }
+                    else if (content.type === 'movie' && content.videoFiles) {
+                        // For movies, add each video file version
+                        const { year: matchYear } = extractMovieTitleAndYear(match.name);
+                        for (const video of content.videoFiles) {
+                            // Extract video quality from name
+                            const qualityMatch = video.name.match(/\b(720p|1080p|2160p|4K)\b/i);
+                            const quality = qualityMatch ? qualityMatch[1].toUpperCase() : 'Unknown Quality';
 
-                if (content.type === 'series' && content.episodes) {
-                    metaObject.videos = content.episodes.map((ep, index) => ({
-                        id: `${matchingResult.providerId}:${ep.url}`,
-                        title: ep.name,
-                        season: ep.season,
-                        episode: index + 1
-                    }));
+                            const features = [];
+                            if (video.hasDualAudio) features.push('Dual Audio');
+                            if (video.hasSubtitles) features.push('Subtitled');
+                            const featureString = features.length > 0 ? ` [${features.join(', ')}]` : '';
+
+                            metaObject.videos.push({
+                                id: `${match.providerId}:${video.url}`,
+                                title: `${quality} ${featureString} - ${provider.name}`,
+                                name: video.name,
+                                released: matchYear || meta.year
+                            });
+                        }
+                    }
                 }
+            }
 
-                logDebug('META', `Returning meta object for: ${content.name}`);
+            if (metaObject.videos.length > 0) {
+                if (type === 'movie') {
+                    // Sort movies by quality
+                    metaObject.videos.sort((a, b) => {
+                        const getQualityScore = (title) => {
+                            if (title.includes('1080p')) return 3;
+                            if (title.includes('720p')) return 2;
+                            return 1;
+                        };
+                        return getQualityScore(b.title) - getQualityScore(a.title);
+                    });
+                }
+                else if (type === 'series') {
+                    // Sort series by season and episode
+                    metaObject.videos.sort((a, b) => {
+                        if (a.season !== b.season) return a.season - b.season;
+                        return a.episode - b.episode;
+                    });
+                }
+                
+                logDebug('META', `Returning meta object with ${metaObject.videos.length} videos for: ${meta.name}`);
                 return { meta: metaObject };
-            }
-        }
-        
-        // Try fallback search for movies if no match found with full title
-        if (type === 'movie') {
-            logDebug('META', `No match found with full title. Trying fallback search for: ${meta.name}`);
-            // Try simplified search using just the first part of the title
-            const simplified = meta.name.includes(':') 
-                ? meta.name.split(':')[0].trim() 
-                : meta.name.split(/\s+/g).slice(0, 2).join(' ');
-            
-            if (simplified !== meta.name && simplified.length > 0) {
-                logDebug('META', `Using simplified title for fallback search: "${simplified}"`);
-                
-                // Search all providers with simplified title
-                for (const [providerId, provider] of Object.entries(PROVIDERS)) {
-                    if (!provider.supportedTypes.includes(type)) continue;
-                    
-                    try {
-                        const fallbackResults = await search(simplified, provider);
-                        let bestFallbackMatch = null;
-                        let bestFallbackScore = 0;
-                        
-                        for (const result of fallbackResults) {
-                            if (result.type !== type) continue;
-                            
-                            const cleanResultName = result.name.toLowerCase()
-                                .replace(/[^\w\s]/g, '')
-                                .replace(/\s+/g, ' ')
-                                .trim();
-                            
-                            const cleanSimplifiedName = simplified.toLowerCase()
-                                .replace(/[^\w\s]/g, '')
-                                .replace(/\s+/g, ' ')
-                                .trim();
-                            
-                            // Calculate match score
-                            let score = 0;
-                            
-                            if (cleanResultName.includes(cleanSimplifiedName) || cleanSimplifiedName.includes(cleanResultName)) {
-                                score += 10;
-                                
-                                // Extract year information
-                                const { year } = extractMovieTitleAndYear(result.name);
-                                
-                                if (cleanResultName === cleanSimplifiedName) {
-                                    score += 5;
-                                }
-                                
-                                // Check if the full title is in the result name
-                                const cleanFullName = meta.name.toLowerCase()
-                                    .replace(/[^\w\s]/g, '')
-                                    .replace(/\s+/g, ' ')
-                                    .trim();
-                                
-                                if (cleanResultName.includes(cleanFullName)) {
-                                    score += 8;
-                                    logDebug('META', `Fallback result contains full title: "${result.name}"`);
-                                }
-                                
-                                // Bonus points if year matches
-                                if (year && meta.year) {
-                                    const yearDiff = Math.abs(year - meta.year);
-                                    
-                                    if (yearDiff === 0) {
-                                        score += 10;
-                                        logDebug('META', `Year match in fallback: ${year} === ${meta.year} for "${result.name}"`);
-                                    } else if (yearDiff === 1) {
-                                        score += 3;
-                                    }
-                                }
-                                
-                                if (score > bestFallbackScore) {
-                                    bestFallbackScore = score;
-                                    bestFallbackMatch = result;
-                                }
-                            }
-                        }
-                        
-                        // Use best fallback match if found
-                        if (bestFallbackMatch) {
-                            logDebug('META', `Found fallback match in ${providerId}: ${bestFallbackMatch.name} (score: ${bestFallbackScore})`);
-                            
-                            // Add provider ID to the result
-                            bestFallbackMatch.providerId = providerId;
-                            
-                            const content = await load(bestFallbackMatch.url, provider);
-                            
-                            if (content) {
-                                const metaObject = {
-                                    id: `${providerId}:${bestFallbackMatch.url}`,
-                                    type: content.type,
-                                    name: content.name,
-                                    poster: content.poster
-                                };
-                                
-                                logDebug('META', `Fallback search successful. Returning meta for: ${content.name}`);
-                                return { meta: metaObject };
-                            }
-                        }
-                    } catch (error) {
-                        logDebug('META_ERROR', `Error in fallback search for provider ${providerId}`, { error: error.message });
-                        continue;
-                    }
-                }
             }
         }
 
@@ -934,12 +903,18 @@ builder.defineMetaHandler(async ({ type, id }) => {
         };
         
         if (content.type === 'series' && content.episodes) {
-            metaObject.videos = content.episodes.map((ep, index) => ({
-                id: `${providerId}:${ep.url}`,
-                title: ep.name,
-                season: ep.season,
-                episode: index + 1
-            }));
+            // Sort episodes by season and episode number
+            metaObject.videos = content.episodes
+                .sort((a, b) => {
+                    if (a.season !== b.season) return a.season - b.season;
+                    return a.episode - b.episode;
+                })
+                .map((ep) => ({
+                    id: `${providerId}:${ep.url}`,
+                    title: ep.name,
+                    season: ep.season,
+                    episode: ep.episode
+                }));
         }
         
         logDebug('META', `Returning meta object for: ${content.name}`);
@@ -1236,9 +1211,7 @@ builder.defineStreamHandler(async ({ type, id }) => {
                                             score += 10; // Higher score for exact match
                                             logDebug('STREAM', `Year match found: ${year} === ${meta.year} for "${result.name}"`);
                                         } else if (yearDiff === 1) {
-                                            // Off by one year (common for early/late releases)
                                             score += 3;
-                                            logDebug('STREAM', `Near year match found: ${year} vs ${meta.year} (diff: ${yearDiff})`);
                                         }
                                     }
                                 
